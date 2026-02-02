@@ -1,1 +1,301 @@
+#from flask import Flask, render_template, request, jsonify
+import os, uuid, json
+from dotenv import load_dotenv
+from PyPDF2 import PdfReader
+from sentence_transformers import SentenceTransformer
+from pinecone import Pinecone, ServerlessSpec
+from huggingface_hub import InferenceClient   # ← changed
 
+# ============================================================
+# LOAD ENV + CONFIG
+# ============================================================
+load_dotenv()
+
+# !! Replace with your real HF token (read access is usually enough)
+HF_TOKEN = os.getenv("HF_API_TOKEN") or "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"
+
+PINECONE_API_KEY = os.getenv("PINECONE_API_KEY") or "pcsk_5xbrB1_AxxZTUaQmxNnwuw1aXLh2b3hMtLQVQNzFxKRZ4J7b51eGvYCKua7tpH9wMdc4zB"
+EMBEDDER_MODEL = "all-MiniLM-L6-v2"
+INDEX_NAME = "rag-index"
+NAMESPACE = "pdf-chunks"
+UPLOAD_DIR = "uploads"
+
+MODEL_REPO = "meta-llama/Meta-Llama-3-8B-Instruct"  # or 1B / 11B-vision if needed
+
+os.makedirs(UPLOAD_DIR, exist_ok=True)
+os.makedirs("templates", exist_ok=True)
+os.makedirs("static", exist_ok=True)
+
+history = []
+uploaded_files = []
+
+# ============================================================
+# INIT MODELS + PINECONE
+# ============================================================
+embedder = SentenceTransformer(EMBEDDER_MODEL)
+
+pc = Pinecone(api_key=PINECONE_API_KEY)
+if INDEX_NAME not in [i["name"] for i in pc.list_indexes()]:
+    pc.create_index(
+        name=INDEX_NAME,
+        dimension=384,
+        metric="cosine",
+        spec=ServerlessSpec(cloud="aws", region="us-east-1")
+    )
+index = pc.Index(INDEX_NAME)
+
+# Hugging Face client (serverless inference)
+hf_client = InferenceClient(
+    model=MODEL_REPO,
+    token=HF_TOKEN
+)
+
+# ============================================================
+# PDF PROCESSING FUNCTIONS  (unchanged)
+# ============================================================
+def extract_text(path):
+    try:
+        reader = PdfReader(path)
+        text = ""
+        for p in reader.pages:
+            t = p.extract_text()
+            if t: text += t + "\n"
+        return text.strip()
+    except:
+        return ""
+
+def chunk_text(text, size=350, overlap=80):
+    words = text.split()
+    chunks = []
+    i = 0
+    while i < len(words):
+        chunks.append(" ".join(words[i:i+size]))
+        i += size - overlap
+    return chunks or ["EMPTY DOCUMENT"]
+
+def store_chunks(chunks, pdf_name):
+    embeddings = embedder.encode(chunks)
+    vectors = [
+        (str(uuid.uuid4()), emb.tolist(), {"text": chunk, "file": pdf_name})
+        for chunk, emb in zip(chunks, embeddings)
+    ]
+    index.upsert(vectors=vectors, namespace=NAMESPACE)
+    return len(vectors)
+
+def delete_pdf_vectors(pdf_name):
+    res = index.query(vector=[0]*384, top_k=5000, include_metadata=True, namespace=NAMESPACE)
+    ids = [m["id"] for m in res["matches"] if m["metadata"].get("file") == pdf_name]
+    if ids:
+        index.delete(ids=ids, namespace=NAMESPACE)
+    return len(ids)
+
+# ============================================================
+# AI FUNCTIONS  ← changed
+# ============================================================
+def retrieve_context(q):
+    q_emb = embedder.encode(q).tolist()
+    res = index.query(vector=q_emb, top_k=7, include_metadata=True, namespace=NAMESPACE)
+    return "\n\n".join(m["metadata"]["text"] for m in res["matches"])
+
+def ask_llm(prompt):
+    try:
+        response = hf_client.chat_completion(
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=1024,
+            temperature=0.7,
+            stream=False
+        )
+        return response.choices[0].message.content.strip()
+    except Exception as e:
+        return f"HF API error: {str(e)}"
+
+# ============================================================
+# FLASK APP  (mostly unchanged)
+# ============================================================
+app = Flask(__name__)
+
+@app.route("/")
+def home():
+    return render_template("index.html")
+
+@app.route("/upload", methods=["POST"])
+def upload():
+    global uploaded_files
+    if "pdfs" not in request.files:
+        return jsonify({"error": "No files"}), 400
+    files = request.files.getlist("pdfs")
+    results = []
+    for pdf in files:
+        name = pdf.filename
+        if not name.lower().endswith(".pdf"):
+            results.append({"file": name, "error": "Not a PDF"})
+            continue
+        path = os.path.join(UPLOAD_DIR, name)
+        pdf.save(path)
+        text = extract_text(path)
+        if len(text) < 20:
+            results.append({"file": name, "error": "Unreadable PDF"})
+            continue
+        chunks = chunk_text(text)
+        count = store_chunks(chunks, name)
+        uploaded_files.append(name)
+        results.append({"file": name, "message": f"Stored {count} chunks"})
+    return jsonify({"uploaded": results, "files": uploaded_files})
+
+@app.route("/remove_pdf", methods=["POST"])
+def remove_pdf():
+    global uploaded_files
+    name = request.form.get("file", "")
+    if name not in uploaded_files:
+        return jsonify({"error": "File not found"}), 400
+    deleted = delete_pdf_vectors(name)
+    try:
+        os.remove(os.path.join(UPLOAD_DIR, name))
+    except:
+        pass
+    uploaded_files.remove(name)
+    return jsonify({"message": f"Removed {name} ({deleted} chunks)", "files": uploaded_files})
+
+@app.route("/remove_all", methods=["POST"])
+def remove_all():
+    global uploaded_files
+    index.delete(delete_all=True, namespace=NAMESPACE)
+    uploaded_files = []
+    for f in os.listdir(UPLOAD_DIR):
+        os.remove(os.path.join(UPLOAD_DIR, f))
+    return jsonify({"message": "All PDFs removed", "files": []})
+
+@app.route("/ask", methods=["POST"])
+def ask():
+    q = request.form.get("question", "")
+    context = retrieve_context(q)
+    prompt = f"""
+Use ONLY the context. If answer not found, reply "I don't know".
+CONTEXT:
+{context}
+
+QUESTION:
+{q}
+
+ANSWER:
+"""
+    answer = ask_llm(prompt)
+    history.append({"q": q, "a": answer})
+    return jsonify({"answer": answer, "history": history})
+
+# HTML and CSS writing remains the same
+with open("templates/index.html", "w", encoding="utf-8") as f:
+    f.write("""
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<title>Multi-PDF RAG Chat</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<div class="container">
+<div class="sidebar">
+    <h2>Uploaded PDFs</h2>
+    <div id="filelist"></div>
+    <button onclick="removeAll()">Remove All</button>
+    <h2>History</h2>
+    <div id="history"></div>
+</div>
+<div class="main">
+    <div id="response">Upload PDFs to begin</div>
+    <div class="input-area">
+        <input type="file" id="pdfs" multiple hidden>
+        <button onclick="document.getElementById('pdfs').click()">Upload PDFs</button>
+        <!-- Model selection removed - using HF Llama-3.2 -->
+        <input id="q" type="text" placeholder="Ask something...">
+        <button onclick="send()">Send</button>
+    </div>
+</div>
+</div>
+<script>
+// ... (rest of your JavaScript remains almost the same, just removed model select part)
+document.getElementById("pdfs").onchange = async () => {
+    const files = document.getElementById("pdfs").files;
+    let fd = new FormData();
+    for (let f of files) fd.append("pdfs", f);
+    const r = await fetch("/upload", {method:"POST", body:fd});
+    const j = await r.json();
+    let out = "";
+    j.uploaded.forEach(u=>{
+        if (u.error) out += "<div class='msg error'>" + u.file + ": " + u.error + "</div>";
+        else out += "<div class='msg success'>" + u.file + ": " + u.message + "</div>";
+    });
+    document.getElementById("response").innerHTML = out;
+    updateFileList(j.files);
+};
+async function removeFile(name){
+    let fd = new FormData();
+    fd.append("file", name);
+    const r = await fetch("/remove_pdf", {method:"POST", body:fd});
+    const j = await r.json();
+    updateFileList(j.files);
+    document.getElementById("response").innerHTML = j.message;
+}
+async function removeAll(){
+    const r = await fetch("/remove_all", {method:"POST"});
+    const j = await r.json();
+    updateFileList([]);
+    document.getElementById("response").innerHTML = j.message;
+}
+async function send(){
+    const fd = new FormData();
+    fd.append("question", document.getElementById("q").value);
+    const r = await fetch("/ask", {method:"POST", body:fd});
+    const j = await r.json();
+    add("You: " + document.getElementById("q").value, "q");
+    add("Answer: " + j.answer, "a");
+    updateHistory(j.history);
+}
+function add(t,c){
+    const d=document.createElement("div");
+    d.className="msg "+c;
+    d.innerHTML=t;
+    document.getElementById("response").appendChild(d);
+}
+function updateHistory(h){
+    const div=document.getElementById("history");
+    div.innerHTML="";
+    h.forEach(x=>{
+        let d=document.createElement("div");
+        d.innerText=x.q;
+        div.appendChild(d);
+    });
+}
+function updateFileList(files){
+    const fl=document.getElementById("filelist");
+    fl.innerHTML="";
+    files.forEach(f=>{
+        fl.innerHTML += "<div class='file-item'>" + f + " <button onclick=\\\"removeFile('" + f + "')\\\">X</button></div>";
+    });
+}
+</script>
+</body>
+</html>
+    """)
+
+with open("static/style.css", "w", encoding="utf-8") as f:
+    f.write("""
+body {background:#111;color:#eee;margin:0;font-family:Arial;}
+.container {display:flex;height:100vh;}
+.sidebar {width:280px;background:#222;padding:10px;overflow-y:auto;}
+.main {flex:1;display:flex;flex-direction:column;}
+#response {flex:1;padding:15px;overflow-y:auto;background:#111;}
+.input-area {padding:10px;background:#222;display:flex;gap:10px;}
+button,input,select {padding:10px;border:none;border-radius:6px;background:#333;color:white;}
+.msg {padding:10px;margin:10px 0;border-radius:5px;}
+.success {background:#004400;color:#90ff90;}
+.error {background:#440000;color:#ff9090;}
+.q {background:#003300;}
+.a {background:#330000;}
+.file-item {background:#333;padding:5px;margin:5px 0;border-radius:5px;display:flex;justify-content:space-between;}
+    """)
+
+if __name__ == "__main__":
+    print("🚀 Multi-PDF RAG (HF Inference) running at http://127.0.0.1:5000/")
+    app.run(host="0.0.0.0", port=5000, debug=True)
